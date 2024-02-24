@@ -1,0 +1,818 @@
+//var aa=ee.FeatureCollection(polygon)
+Map.addLayer(Study_Area,{},'Study Mangrove Area')
+Map.setOptions('Satellite')
+Map.centerObject(Study_Area,10)
+// ///////////////////////////////////////////////////////////////
+// //            2) Set up Filtered Landsat Composite           //
+// ///////////////////////////////////////////////////////////////
+
+// //2.1) Cloud Masking
+// ////////////////////
+
+// //Landsat data includes a 'pixel_qa' band which can be used to create 
+// //     a function to mask clouds
+
+function maskClouds(image) {
+  
+//   // Bits 3 and 5 are cloud shadow and cloud, respectively.
+     var cloudShadowBitMask = ee.Number(2).pow(3).int();
+     var cloudsBitMask = ee.Number(2).pow(5).int();  
+    
+//     // Get the pixel QA band.
+     var qa = image.select('pixel_qa');
+    
+//     // Both flags should be set to zero, indicating clear conditions.
+     var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0).and(qa.bitwiseAnd(cloudsBitMask).eq(0)); 
+  
+//   // Return the masked image, scaled to [0, 1].
+   return image.updateMask(mask).divide(10000).copyProperties(image, ["system:time_start"]);
+ }
+
+// //2.2) Adding Spectral Indices
+// ///////////////////////////////
+
+// // This function maps spectral indices for Mangrove Mapping using Landsat 8 Imagery
+var addIndicesL8 = function(img) {
+//   // NDVI
+   var ndvi = img.normalizedDifference(['B5','B4']).rename('NDVI');
+//   // NDMI (Normalized Difference Mangrove Index - Shi et al 2016 - New spectral metrics for mangrove forest identification)
+   var ndmi = img.normalizedDifference(['B5','B6']).rename('NDMI');
+//   // MNDWI (Modified Normalized Difference Water Index - Hanqiu Xu, 2006)
+   var mndwi = img.normalizedDifference(['B3','B6']).rename('MNDWI');
+   //   // SAVI (SAVI2019)
+  var savi = img.expression('((NIR-RED)/(NIR+RED+0.5))*1.5',{
+     'NIR':img.select('B5'),
+     'RED':img.select('B4')
+   }).rename('SAVI');
+//   // SR (Simple Ratio)
+   var sr = img.select('B5').divide(img.select('B4')).rename('SR');
+//   // Band Ratio 54
+   var ratio54 = img.select('B6').divide(img.select('B5')).rename('R54');
+//   // Band Ratio 35
+   var ratio35 = img.select('B4').divide(img.select('B6')).rename('R35');
+//   // GCVI
+   var mdvi = img.expression('(NIR-GREEN)/(SWIR-GREEN)',{
+     'NIR':img.select('B5'),
+     'GREEN':img.select('B3'),
+     'SWIR':img.select('B6')
+   }).rename('MDVI');
+   var gcvi = img.expression('(NIR/GREEN)-1',{
+     'NIR':img.select('B5'),
+     'GREEN':img.select('B3')
+   }).rename('GCVI');
+   return img
+     .addBands(ndvi)
+     .addBands(ndmi)
+     .addBands(mndwi)
+     .addBands(savi)
+     .addBands(sr)
+     .addBands(ratio54)
+     .addBands(ratio35)
+     .addBands(mdvi)
+     .addBands(gcvi);
+ };
+
+// //2.3) Filter Landsat data by Date and Region
+// /////////////////////////////////////////////
+
+// // Temporal Parameters
+
+// // Select the desired central year here
+ var year = 2021; 
+
+// // Start date will be set one year before the central year
+ var startDate = (year-1)+'-01-01'; 
+
+// // End date will be set to one year later than the central year.
+ var endDate = (year+1)+'-12-31'; 
+
+// //2.4) Apply filters and masks to Landsat 8 imagery
+// ///////////////////////////////////////////////////
+
+ var l8 = L8.filterDate(startDate,endDate)
+// // Mask for clouds and cloud shadows
+     .map(maskClouds)
+// //Add the indices
+     .map(addIndicesL8)
+    
+    
+// //2.5) Composite the Landsat image collection
+// /////////////////////////////////////////////
+
+// //You can composite on a per pixel, per-band basis using .median()
+// // OR with quality bands like .qualityMosaic('NDVI')
+
+ var composite = l8
+//               // Uses the median reducer
+               .median() 
+//               // Clips the composite to our area of interest
+               .clip(Study_Area);
+
+// //2.6) Mask to areas of low elevation and high NDVI and MNDWI
+// /////////////////////////////////////////////////////////////
+
+// // Clip SRTM data to region
+   var srtmClip = SRTM.clip(Study_Area);
+
+// //Mask to elevations less than 31 meters
+var elevationMask = srtmClip.lte(10);
+
+// //Used the NDVI and MNDWI bands to create masks
+var NDVIMask = composite.select('NDVI').gt(0.30);
+//var SAVIMask = composite.select('SAVI').gt(0.32);
+var MNDWIMask = composite.select('MNDWI').gt(-0.50);
+
+// //Apply the masks
+var compositeNew = composite
+                        .updateMask(NDVIMask)
+//                        .updateMask(SAVIMask)
+                        .updateMask(MNDWIMask)
+                        .updateMask(elevationMask)
+// //2.7) Display results
+// ///////////////////////
+
+// //Select bands and parameters for visualization
+var visPar = {bands:['B5','B4','B3'], min: 0, max: 0.35};
+// //Add layer to map
+Map.addLayer(compositeNew, visPar, 'FCC_MANG 2021')
+
+// ///////////////////////////////////////////////////////////////
+// //          3) Construct Random Forest Model                 //
+// ///////////////////////////////////////////////////////////////
+
+// //3.1) Prepare training data and predictors
+// ////////////////////////////////////////////
+
+// //After drawing training polygons, merge them together
+var classes = Mangrove2021.merge(NonMangrove2021)
+
+// //Define the bands you want to include in the model
+var bands = ['B5','B6','B4','B3','NDVI','MNDWI','SAVI','SR','MDVI','GCVI']
+
+// //Create a variable called image to select the bands of interest and clip to geometry
+var image = compositeNew.select(bands).clip(Study_Area)
+   
+// //Assemble samples for the model
+var samples = image.sampleRegions({
+    collection: classes, // Set of geometries selected for training
+    properties: ['landcover'], // Label from each geometry
+    scale: 30 // Make each sample the same size as Landsat pixel
+    }).randomColumn('random'); // creates a column with random numbers
+    
+// //Here we randomly split our samples to set some aside for testing our model's accuracy
+// // using the "random" column we created
+var split = 0.8; // Roughly 80% for training, 20% for testing.
+var training = samples.filter(ee.Filter.lt('random', split)); //Subset training data
+var testing = samples.filter(ee.Filter.gte('random', split)); //Subset testing data
+
+
+// //Print these variables to see how much training and testing data you are using
+    print('Samples n_2021 =', samples.aggregate_count('.all'));
+    print('Training n_2021 =', training.aggregate_count('.all'));
+    print('Testing n_2021 =', testing.aggregate_count('.all'));
+
+// //3.2) Begin Random Forest Classification
+// /////////////////////////////////////////
+
+//.smileRandomForest is used to run the model. Here we run the model using 100 trees
+// and 5 randomly selected predictors per split ("(100,7)")
+    var classifier = ee.Classifier.smileRandomForest(100,7).train({ 
+    features: training.select(['B5','B6','B4','B3','NDVI','MNDWI','SAVI','SR','MDVI','GCVI', 'landcover']), //Train using bands and landcover property
+    classProperty: 'landcover', //Pull the landcover property from classes
+    inputProperties: bands
+    });
+
+// //3.3) Test the accuracy of the model
+// //////////////////////////////////////
+
+    var validation = testing.classify(classifier);
+    var testAccuracy = validation.errorMatrix('landcover', 'classification');
+    print('Validation error matrix RF: ', testAccuracy);
+    print('Validation overall accuracy RF: ', testAccuracy.accuracy());
+
+// //3.4) Classify the Landsat composite using the Random Forest model
+// ///////////////////////////////////////////////////////////////////
+
+    var classifiedrf = image.select(bands) // select the predictors
+                      .classify(classifier); // .classify applies the Random Forest
+                      
+// //The model results may be "noisy". To reduce noise, create a mask to mask
+// // unconnected pixels
+    var pixelcount = classifiedrf.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+    var countmask = pixelcount.select(0).gt(25); //filter out all pixels connected to 4 or less 
+
+// //Mask the results to only display mangrove extent
+    var classMask = classifiedrf.select('classification').gt(0)
+    var classed= classifiedrf.updateMask(countmask).updateMask(classMask)
+
+// //3.5) Map results
+// ////////////////////
+
+// //Add classification to map
+Map.addLayer (classed, {min: 1, max: 1, palette:'green'}, 'Mangrove Extent 2021');
+
+// //For comparison, let's add the GMW dataset to the map
+var GMW = GlobalMangrove.median().clip(Study_Area);
+Map.addLayer (GMW, {min: 1, max: 1,palette:'yellow'}, 'Global Mangrove')
+
+
+
+// ///////////////////////////////////////////////////////////////
+// //          4) Timeseries Comparison Map                     //
+// ///////////////////////////////////////////////////////////////
+
+// //4.1) Adding Landsat 5 Spectral Indices
+// ////////////////////////////////////////////
+
+// // Both collections have different band numbers that are different, so I created two functions in regard to each individual set of bands 
+
+// // This function maps spectral indices for Mangrove Mapping using Landsat 7 Imagery
+var addIndicesL5 = function(img) {
+  // NDVI
+  var ndvi = img.normalizedDifference(['B4','B3']).rename('NDVI');
+  // NDMI (Normalized Difference Mangrove Index - Shi et al 2016 - New spectral metrics for mangrove forest identification)
+  var ndmi = img.normalizedDifference(['B4','B5']).rename('NDMI');
+  // MNDWI (Modified Normalized Difference Water Index - Hanqiu Xu, 2006)
+  var mndwi = img.normalizedDifference(['B2','B5']).rename('MNDWI');
+   //   // SAVI (SAVI2019)
+  var savi = img.expression('((NIR-RED)/(NIR+RED+0.5))*1.5',{
+     'NIR':img.select('B4'),
+     'RED':img.select('B3')
+   }).rename('SAVI');
+  // SR (Simple Ratio)
+  var sr = img.select('B4').divide(img.select('B3')).rename('SR');
+  // Band Ratio 54
+  var ratio54 = img.select('B5').divide(img.select('B4')).rename('R54');
+  // Band Ratio 35
+  var ratio35 = img.select('B3').divide(img.select('B5')).rename('R35');
+  // GCVI
+  var mdvi = img.expression('(NIR-GREEN)/(SWIR-GREEN)',{
+    'NIR':img.select('B4'),
+    'GREEN':img.select('B2'),
+    'SWIR':img.select('B5')
+  }).rename('MDVI');
+  var gcvi = img.expression('(NIR/GREEN)-1',{
+    'NIR':img.select('B4'),
+    'GREEN':img.select('B2')
+  }).rename('GCVI');
+  return img
+    .addBands(ndvi)
+    .addBands(ndmi)
+    .addBands(mndwi)
+    .addBands(savi)
+    .addBands(sr)
+    .addBands(ratio54)
+    .addBands(ratio35)
+    .addBands(mdvi)
+    .addBands(gcvi);
+};
+
+
+// //4.2) Filter Landsat data by Date and Region
+// /////////////////////////////////////////////
+
+// // Temporal Parameters
+
+// Select the desired central year here
+var year = 2011; 
+
+// Start date will be set one year before the central year
+var startDate = (year-1)+'-01-01'; 
+
+// End date will be set to one year later than the central year.
+var endDate = (year+1)+'-12-31'; 
+
+// //4.3) Apply filters and masks to Landsat 7 imagery
+// ///////////////////////////////////////////////////
+
+var l5 = L5.filterDate(startDate,endDate)
+// Mask for clouds and cloud shadows
+    .map(maskClouds)  //We use the same function we used for Landsat 8
+//Add the indices
+    .map(addIndicesL5)
+    
+// //4.4) Composite the Landsat image collection
+// /////////////////////////////////////////////
+
+// //You can composite on a per pixel, per-band basis using .median()
+// // OR with quality bands like .qualityMosaic('NDVI')
+
+var L5composite = l5
+              // Uses the median reducer
+              .median() 
+              // Clips the composite to our area of interest
+              .clip(Study_Area); 
+
+// //4.5) Mask to areas of low elevation and high NDVI and MNDWI
+// /////////////////////////////////////////////////////////////
+
+// //Used the NDVI and MNDWI bands to create masks
+var L5NDVIMask_2011 = L5composite.select('NDVI').gt(0.30);
+//var L5SAVIMask_2011 = composite.select('SAVI').gt(0.3);
+var L5MNDWIMask_2011 = L5composite.select('MNDWI').gt(-0.50);
+
+//Apply the masks
+var L5compositeNew = L5composite
+                        .updateMask(L5NDVIMask_2011)
+//                        .updateMask(L5SAVIMask_2011)
+                        .updateMask(L5MNDWIMask_2011)
+                        .updateMask(elevationMask) //We can use the same mask as before
+                        
+// //4.6) Display results
+// ///////////////////////
+
+// //Select bands and parameters for visualization
+// //We use bands 4, 5, and 3 instead
+var L5visPar = {bands:['B4','B3','B2'], min: 0, max: 0.35}; 
+
+//Add layer to map
+Map.addLayer(L5compositeNew, L5visPar, 'FCC_MANG 2011')
+
+
+// ///////////////////////////////////////////////////////////////
+// //          5) Construct  New Random Forest Model           //
+// ///////////////////////////////////////////////////////////////
+
+// //5.1) Prepare training data and predictors
+// ////////////////////////////////////////////
+
+// //After drawing training polygons, merge them together
+var classes2011 = Mangrove2011.merge(NonMangrove2011)
+
+//Define the bands you want to include in the model
+var L5bands = ['B4','B5','B3','B2','NDVI','MNDWI','SAVI','SR','MDVI','GCVI']
+
+//Create a variable called image to select the bands of interest and clip to geometry
+var L5image = L5compositeNew.select(L5bands).clip(Study_Area)
+   
+//Assemble samples for the model
+var L5samples = L5image.sampleRegions({
+    collection: classes2011, // Set of geometries selected for training
+    properties: ['landcover'], // Label from each geometry
+    scale: 30 // Make each sample the same size as Landsat pixel
+    }).randomColumn('random'); // creates a column with random numbers
+    
+//Here we randomly split our samples to set some aside for testing our model's accuracy
+// using the "random" column we created
+var L5training = L5samples.filter(ee.Filter.lt('random', split)); //Subset training data
+var L5testing = L5samples.filter(ee.Filter.gte('random', split)); //Subset testing data
+
+
+//Print these variables to see how much training and testing data you are using
+    print('Samples n_2011 =', L5samples.aggregate_count('.all'));
+    print('Training n_2011 =', L5training.aggregate_count('.all'));
+    print('Testing n_2011 =', L5testing.aggregate_count('.all'));
+
+// //5.2) Begin Random Forest Classification
+// /////////////////////////////////////////
+
+//.smileRandomForest is used to run the model. Here we run the model using 100 trees
+// and 5 randomly selected predictors per split ("(100,7)")
+    var L5classifier = ee.Classifier.smileRandomForest(100,7).train({ 
+    features: L5training.select(['B4','B5','B3','B2','NDVI','MNDWI','SAVI','SR','MDVI','GCVI', 'landcover']), //Train using bands and landcover property
+    classProperty: 'landcover', //Pull the landcover property from classes
+    inputProperties: L5bands
+    });
+
+//5.3) Classify the Landsat composite using the Random Forest model
+////////////////////////////////////////////////////////////////////
+
+    var L5classifiedrf = L5image.select(L5bands) // select the predictors
+                      .classify(L5classifier); // .classify applies the Random Forest
+                      
+//The model results may be "noisy". To reduce noise, create a mask to mask
+// unconnected pixels
+    var pixelcount = L5classifiedrf.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+    var countmask = pixelcount.select(0).gt(25); //filter out all pixels connected to 4 or less 
+
+//Mask the results to only display mangrove extent
+    var L5classMask = L5classifiedrf.select('classification').gt(0)
+    var L5classed= L5classifiedrf.updateMask(countmask).updateMask(L5classMask)
+
+//5.5) Map results
+//////////////////
+
+//Add classification to map
+Map.addLayer (L5classed, {min: 1, max: 1, palette:'blue'}, 'Mangrove Extent 2011');
+
+
+// ///////////////////////////////////////////////////////////////
+// //          4) Timeseries Comparison Map                     //
+// ///////////////////////////////////////////////////////////////
+
+// //4.1) Adding Landsat 7 Spectral Indices
+// ////////////////////////////////////////////
+
+// // Both collections have different band numbers that are different, so I created two functions in regard to each individual set of bands 
+
+// // This function maps spectral indices for Mangrove Mapping using Landsat 7 Imagery
+
+
+// //4.2) Filter Landsat data by Date and Region
+// /////////////////////////////////////////////
+// // Temporal Parameters
+
+// Select the desired central year here
+var year = 2001; 
+
+// Start date will be set one year before the central year
+var startDate = (year-1)+'-01-01'; 
+
+// End date will be set to one year later than the central year.
+var endDate = (year+1)+'-12-31'; 
+
+// //4.3) Apply filters and masks to Landsat 7 imagery
+// ///////////////////////////////////////////////////
+
+var l5_2001 = L5.filterDate(startDate,endDate)
+// Mask for clouds and cloud shadows
+    .map(maskClouds)  //We use the same function we used for Landsat 8
+//Add the indices
+    .map(addIndicesL5)
+    
+// //4.4) Composite the Landsat image collection
+// /////////////////////////////////////////////
+
+// //You can composite on a per pixel, per-band basis using .median()
+// // OR with quality bands like .qualityMosaic('NDVI')
+
+var L5composite_2001 = l5_2001
+              // Uses the median reducer
+              .median() 
+              // Clips the composite to our area of interest
+              .clip(Study_Area); 
+
+// //4.5) Mask to areas of low elevation and high NDVI and MNDWI
+// /////////////////////////////////////////////////////////////
+
+// //Used the NDVI and MNDWI bands to create masks
+var L5NDVIMask_2001 = L5composite_2001.select('NDVI').gt(0.30);
+//var L5SAVIMask_2001 = composite.select('SAVI').gt(0.3);
+var L5MNDWIMask_2001 = L5composite_2001.select('MNDWI').gt(-0.50);
+
+//Apply the masks
+var L5compositeNew_2001 = L5composite_2001
+                        .updateMask(L5NDVIMask_2001)
+//                        .updateMask(L5SAVIMask_2001)
+                        .updateMask(L5MNDWIMask_2001)
+                        .updateMask(elevationMask) //We can use the same mask as before
+                        
+// //4.6) Display results
+// ///////////////////////
+
+// //Select bands and parameters for visualization
+// //We use bands 4, 5, and 3 instead
+
+//Add layer to map
+Map.addLayer(L5compositeNew_2001, L5visPar, 'FCC_MANG 2001')
+
+
+// ///////////////////////////////////////////////////////////////
+// //          5) Construct  New Random Forest Model           //
+// ///////////////////////////////////////////////////////////////
+
+// //5.1) Prepare training data and predictors
+// ////////////////////////////////////////////
+
+// // //After drawing training polygons, merge them together
+var classes2001 = Mangrove2001.merge(NonMangrove2001)
+
+// //Define the bands you want to include in the model
+var L5bands_2001 = ['B4','B5','B3','B2','NDVI','MNDWI','SAVI','SR','MDVI','GCVI']
+
+//Create a variable called image to select the bands of interest and clip to geometry
+var L5image_2001 = L5compositeNew_2001.select(L5bands_2001).clip(Study_Area)
+   
+//Assemble samples for the model
+var L5samples_2001 = L5image_2001.sampleRegions({
+    collection: classes2001, // Set of geometries selected for training
+    properties: ['landcover'], // Label from each geometry
+    scale: 30 // Make each sample the same size as Landsat pixel
+    }).randomColumn('random'); // creates a column with random numbers
+    
+//Here we randomly split our samples to set some aside for testing our model's accuracy
+// using the "random" column we created
+var L5training_2001 = L5samples_2001.filter(ee.Filter.lt('random', split)); //Subset training data
+var L5testing_2001 = L5samples_2001.filter(ee.Filter.gte('random', split)); //Subset testing data
+
+
+//Print these variables to see how much training and testing data you are using
+    print('Samples n_2001 =', L5samples_2001.aggregate_count('.all'));
+    print('Training n_2001 =', L5training_2001.aggregate_count('.all'));
+    print('Testing n_2001 =', L5testing_2001.aggregate_count('.all'));
+
+// //5.2) Begin Random Forest Classification
+// /////////////////////////////////////////
+
+//.smileRandomForest is used to run the model. Here we run the model using 100 trees
+// and 6 randomly selected predictors per split ("(100,7)")
+    var L5classifier_2001 = ee.Classifier.smileRandomForest(100,7).train({ 
+    features: L5training_2001.select(['B4','B5','B3','B2','NDVI','MNDWI','SAVI','SR','MDVI','GCVI', 'landcover']), //Train using bands and landcover property
+    classProperty: 'landcover', //Pull the landcover property from classes
+    inputProperties: L5bands_2001
+    });
+
+//5.3) Classify the Landsat composite using the Random Forest model
+////////////////////////////////////////////////////////////////////
+
+    var L5classifiedrf_2001 = L5image_2001.select(L5bands_2001) // select the predictors
+                      .classify(L5classifier_2001); // .classify applies the Random Forest
+                      
+//The model results may be "noisy". To reduce noise, create a mask to mask
+// unconnected pixels
+    var pixelcount = L5classifiedrf_2001.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+    var countmask = pixelcount.select(0).gt(25); //filter out all pixels connected to 4 or less 
+
+//Mask the results to only display mangrove extent
+    var L5classMask_2001 = L5classifiedrf_2001.select('classification').gt(0)
+    var L5classed_2001= L5classifiedrf_2001.updateMask(countmask).updateMask(L5classMask)
+
+//5.5) Map results
+//////////////////
+
+//Add classification to map
+Map.addLayer (L5classed_2001, {min: 1, max: 1, palette:'pink'}, 'Mangrove Extent 2001');
+// // Temporal Parameters
+
+// Select the desired central year here
+var year = 1991; 
+
+// Start date will be set one year before the central year
+var startDate = (year-1)+'-01-01'; 
+
+// End date will be set to one year later than the central year.
+var endDate = (year+1)+'-12-31'; 
+
+// //4.3) Apply filters and masks to Landsat 7 imagery
+// ///////////////////////////////////////////////////
+
+var l5_1991 = L5.filterDate(startDate,endDate)
+// Mask for clouds and cloud shadows
+    .map(maskClouds)  //We use the same function we used for Landsat 5
+//Add the indices
+    .map(addIndicesL5)
+    
+// //4.4) Composite the Landsat image collection
+// /////////////////////////////////////////////
+
+// //You can composite on a per pixel, per-band basis using .median()
+// // OR with quality bands like .qualityMosaic('NDVI')
+
+var L5composite_1991 = l5_1991
+              // Uses the median reducer
+              .median() 
+              // Clips the composite to our area of interest
+              .clip(Study_Area); 
+
+// //4.5) Mask to areas of low elevation and high NDVI and MNDWI
+// /////////////////////////////////////////////////////////////
+
+// //Used the NDVI and MNDWI bands to create masks
+var L5NDVIMask_1991 = L5composite_1991.select('NDVI').gt(0.30);
+//var L5SAVIMask_1991 = composite.select('SAVI').gt(0.3);
+var L5MNDWIMask_1991 = L5composite_1991.select('MNDWI').gt(-0.50);
+
+//Apply the masks
+var L5compositeNew_1991 = L5composite_1991
+                        .updateMask(L5NDVIMask_1991)
+//                        .updateMask(L5SAVIMask_1991)
+                        .updateMask(L5MNDWIMask_1991)
+                        .updateMask(elevationMask) //We can use the same mask as before
+                        
+// //4.6) Display results
+// ///////////////////////
+
+// //Select bands and parameters for visualization
+// //We use bands 4, 5, and 3 instead
+
+//Add layer to map
+Map.addLayer(L5compositeNew_1991, L5visPar, 'FCC_MANG 1991')
+
+
+// ///////////////////////////////////////////////////////////////
+// //          5) Construct  New Random Forest Model           //
+// ///////////////////////////////////////////////////////////////
+
+// //5.1) Prepare training data and predictors
+// ////////////////////////////////////////////
+
+// // //After drawing training polygons, merge them together
+var classes1991 = Mangrove1991.merge(NonMangrove1991)
+
+// //Define the bands you want to include in the model
+var L5bands_1991 = ['B4','B5','B3','B2','NDVI','MNDWI','SAVI','SR','MDVI','GCVI']
+
+//Create a variable called image to select the bands of interest and clip to geometry
+var L5image_1991 = L5compositeNew_1991.select(L5bands_1991).clip(Study_Area)
+   
+//Assemble samples for the model
+var L5samples_1991 = L5image_1991.sampleRegions({
+    collection: classes1991, // Set of geometries selected for training
+    properties: ['landcover'], // Label from each geometry
+    scale: 30 // Make each sample the same size as Landsat pixel
+    }).randomColumn('random'); // creates a column with random numbers
+    
+//Here we randomly split our samples to set some aside for testing our model's accuracy
+// using the "random" column we created
+var L5training_1991 = L5samples_1991.filter(ee.Filter.lt('random', split)); //Subset training data
+var L5testing_1991 = L5samples_1991.filter(ee.Filter.gte('random', split)); //Subset testing data
+
+
+//Print these variables to see how much training and testing data you are using
+    print('Samples n_1991 =', L5samples_1991.aggregate_count('.all'));
+    print('Training n_1991 =', L5training_1991.aggregate_count('.all'));
+    print('Testing n_1991 =', L5testing_1991.aggregate_count('.all'));
+
+// //5.2) Begin Random Forest Classification
+// /////////////////////////////////////////
+
+//.smileRandomForest is used to run the model. Here we run the model using 100 trees
+// and 6 randomly selected predictors per split ("(100,7)")
+    var L5classifier_1991 = ee.Classifier.smileRandomForest(100,7).train({ 
+    features: L5training_1991.select(['B4','B5','B3','B2','NDVI','MNDWI','SAVI','SR','MDVI','GCVI', 'landcover']), //Train using bands and landcover property
+    classProperty: 'landcover', //Pull the landcover property from classes
+    inputProperties: L5bands_1991
+    });
+
+//5.3) Classify the Landsat composite using the Random Forest model
+////////////////////////////////////////////////////////////////////
+
+    var L5classifiedrf_1991 = L5image_1991.select(L5bands_1991) // select the predictors
+                      .classify(L5classifier_1991); // .classify applies the Random Forest
+                      
+//The model results may be "noisy". To reduce noise, create a mask to mask
+// unconnected pixels
+    var pixelcount = L5classifiedrf_1991.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+    var countmask = pixelcount.select(0).gt(25); //filter out all pixels connected to 4 or less 
+
+//Mask the results to only display mangrove extent
+    var L5classMask_1991 = L5classifiedrf_1991.select('classification').gt(0)
+    var L5classed_1991= L5classifiedrf_1991.updateMask(countmask).updateMask(L5classMask)
+
+//5.5) Map results
+//////////////////
+
+//Add classification to map
+Map.addLayer (L5classed_1991, {min: 1, max: 1, palette:'purple'}, 'Mangrove Extent 1991');
+
+
+// ///////////////////////////////////////////////////////////////
+// //          6) Calculate Mangrove Area                       //
+// ///////////////////////////////////////////////////////////////
+
+      // //6.1) Calculate Mangrove Area in 1991
+// ///////////////////////////////////////
+
+// //Use reduceRegion with a Sum reducer to calculate total area
+var get1991 = L5classed_1991.multiply(ee.Image.pixelArea()).divide(1000000).reduceRegion({
+      reducer:ee.Reducer.sum(),
+      geometry:Study_Area,
+      scale: 100,
+      maxPixels:1e13,
+      tileScale: 16
+      }).get('classification');
+      
+print(get1991, 'Mangrove Extent 1991 in Km2')
+
+          // //6.1) Calculate Mangrove Area in 2001
+// ///////////////////////////////////////
+
+// //Use reduceRegion with a Sum reducer to calculate total area
+var get2001 = L5classed_2001.multiply(ee.Image.pixelArea()).divide(1000000).reduceRegion({
+      reducer:ee.Reducer.sum(),
+      geometry:Study_Area,
+      scale: 100,
+      maxPixels:1e13,
+      tileScale: 16
+      }).get('classification');
+      
+print(get2001, 'Mangrove Extent 2001 in Km2')
+
+
+// //6.1) Calculate Mangrove Area in 2011
+// ///////////////////////////////////////
+
+// //Use reduceRegion with a Sum reducer to calculate total area
+var get2011 = L5classed.multiply(ee.Image.pixelArea()).divide(1000000).reduceRegion({
+      reducer:ee.Reducer.sum(),
+      geometry:Study_Area,
+      scale: 100,
+      maxPixels:1e13,
+      tileScale: 16
+      }).get('classification');
+      
+print(get2011, 'Mangrove Extent 2011 in Km2')
+
+// //6.2) Calculate Mangrove Area in 2021
+// ///////////////////////////////////////
+
+//Use reduceRegion with a Sum reducer to calculate total area
+var get2021 = classed.multiply(ee.Image.pixelArea()).divide(1000000).reduceRegion({
+      reducer:ee.Reducer.sum(),
+      geometry:Study_Area,
+      scale: 100,
+      maxPixels:1e13,
+      tileScale: 16
+      }).get('classification');
+      
+print(get2021, 'Mangrove Extent 2021 in Km2')
+
+// ///////////////////////////////////////////////////////////////
+// //          7) Running an independent accuracy assessment     //
+// ///////////////////////////////////////////////////////////////
+
+// //These points were created in GEE using Stratified Random Sampling (see below)
+// //We then used the Class Accuracy plug-in (Pete Bunting) to classify each point using
+// //satellie data as validation
+
+// //7.1) Creating Stratified Random Samples
+// ////////////////////////////////////////////
+
+// var stratSamples = classifiedrf.stratifiedSample({
+//                       numPoints:150,        //Number of points per class
+//                       classBand: 'classification',
+//                       region:Study_Area,
+//                       scale: 30,
+//                       geometries:true
+//         });
+
+// //Add a 15m Radius buffer around each point
+// var stratBuff = function(feature) {
+//         var num = feature.get('classification');
+            
+//         return feature.buffer(15).set('classification', num);
+//         };
+        
+// //Map the buffer across all points (see export code below
+// ////////////////////////////////////////////////////////////////////
+
+// var stratPoints = stratSamples.map(stratBuff)
+
+
+// ///////////////////////////////////////////////////////////////
+// //          8) Export Layers of Interest                      //
+// ///////////////////////////////////////////////////////////////
+
+
+//8.1) 2021 Mangrove Extent
+//------------------
+Export.image.toDrive({
+  image: classed,
+  description: '2021MangroveExtent',
+  region: Study_Area,
+  scale: 30,
+  maxPixels: 1e13
+  });
+
+//8.2) 2011 Mangrove Extent
+//------------------
+Export.image.toDrive({
+  image: L5classed,
+  description: '2011MangroveExtent',
+  region: Study_Area,
+  scale: 30,
+  maxPixels: 1e13
+  });
+//8.3) 2001 Mangrove Extent
+//------------------
+Export.image.toDrive({
+  image: L5classed_2001,
+  description: '2001MangroveExtent',
+  region: Study_Area,
+  scale: 30,
+  maxPixels: 1e13
+  });
+  //8.4) 1991 Mangrove Extent
+//------------------
+Export.image.toDrive({
+  image: L5classed_1991,
+  description: '1991MangroveExtent',
+  region: Study_Area,
+  scale: 30,
+  maxPixels: 1e13
+  });
+// //8.5) Stratified Random Samples
+// //-------------------------
+// Export.table.toDrive({
+//   collection: stratPoints,
+//   description:'StratifiedrandomPoints',
+//   fileFormat: 'SHP',
+// });
+//  Batch download format
+// var batch = require('users/fitoprincipe/geetools:batch')
+// batch.Download.ImageCollection.toDrive(water, 'Yearly_Water', 
+//                 {scale: 10, 
+//                 region: Study_Area, 
+//                 type: 'float'})
+var SRTM=SRTM.clip(Study_Area)
+Map.addLayer(SRTM,{},'DEM')
+Export.image.toDrive({
+   image: SRTM,
+   description: 'Elevation',
+   region: Study_Area,
+   scale: 30,
+   maxPixels: 1e13
+   });
+var River_Network = ee.FeatureCollection("WWF/HydroSHEDS/v1/FreeFlowingRivers").filterBounds(Study_Area)
+Map.addLayer(River_Network,{},'river')
+Export.table.toDrive(River_Network,"River","shp");
